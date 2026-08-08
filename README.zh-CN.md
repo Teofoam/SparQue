@@ -1,0 +1,235 @@
+# QQSpark
+
+一个**只读**的 MCP Server，把 QQ 群聊记录喂给大模型，专为 [Gemini Spark](https://gemini.google.com/) 的定时任务而写——让模型每天定点把群里的消息拉一遍，给你写份简报。
+
+*[English](./README.md)*
+
+```
+QQ（小号）
+  └─ NapCat ── OneBot v11 HTTP ──▶ qq_digest_mcp.py ── streamable HTTP ──▶ cloudflared ──▶ Gemini Spark
+                                   （白名单、去噪、
+                                     OCR、脱敏、加围栏）
+```
+
+## 设计原则
+
+1. **只读。** 不暴露任何发送 / 群管 / 撤回类工具。最坏情况是简报质量差，不会替你说话。
+2. **无状态。** 按需向 NapCat 拉历史，不跑常驻 WS、不落库。
+3. **预处理在服务端做。** 白名单、去噪、去复读、截断都在这里完成，喂给模型的是已经瘦过身的文本，省 token 也提高摘要质量。
+
+## 前置
+
+- **NapCat** 已登录 QQ（建议用小号），并在 WebUI「网络配置」里开了一个 **HTTP 服务器**（默认端口 `3000`），且设好 token。
+- **Python 3.10+**，以及 **1.x 版的 MCP SDK**——见下面的版本锁定说明。
+
+### 环境搭建
+
+conda 生态的标准姿势：mamba 管环境，环境内部用 pip 装包。这三个都是纯 Python 包，pip 装没有任何风险。
+
+```bash
+mamba create -n napcat python=3.13
+mamba activate napcat
+pip install "mcp[cli]<2" httpx uvicorn
+```
+
+装完确认一下：
+
+```bash
+python -c "import mcp, httpx, uvicorn; print('ok')"
+```
+
+> ### ⚠️ 必须锁 `mcp<2`
+>
+> 这份代码是按 **1.x** 的 API 写的：`from mcp.server.fastmcp import FastMCP`、`mcp.settings.streamable_http_path`、`mcp.streamable_http_app()`。
+>
+> 现在不指定版本直接 `pip install "mcp[cli]"` 会装到 **2.x**。2.x 把整个分发重排了——types 拆成独立的 `mcp-types` 包，`httpx` 换成了 `httpx2`——而且 `mcp.server.fastmcp` 这个入口是**直接删掉、不是废弃**，所以一启动 import 就炸。1.x 仍在维护，在这份代码迁移完成之前，保持 `<2` 这个上限。
+>
+> 已经装成 2.x 了也不用重建环境，`pip install "mcp[cli]<2"` 就能回去。降级后环境里残留的 `httpx2` 和 `mcp-types` 无害，不用管。
+
+已验证可用的版本：
+
+| 包 | 版本 |
+| --- | --- |
+| Python | 3.13.13 |
+| `mcp` | 1.29.0 |
+| `httpx` | 0.28.1 |
+| `uvicorn` | 0.52.1 |
+| `starlette` | 1.4.1 |
+
+## 启动
+
+`launch.py` 是一键路径：它把 cloudflared 隧道拉起来，从日志里抠出随机域名，塞进 `PUBLIC_HOST`，再带着它启动服务——要填进 Spark 的地址会直接打在屏幕上。
+
+```bash
+export NAPCAT_URL=http://127.0.0.1:3000
+export NAPCAT_TOKEN=你在NapCat里设的token
+export MCP_SECRET=$(python -c "import secrets;print(secrets.token_hex(32))")
+export WATCH_GROUPS=123456789,987654321      # 必填，不填的话什么都读不到
+python launch.py
+```
+
+输出长这样：
+
+```
+起隧道: cloudflared tunnel --url http://127.0.0.1:8765 --protocol http2
+隧道域名: souls-app-sox-ericsson.trycloudflare.com
+MCP endpoint: http://127.0.0.1:8765/mcp/<MCP_SECRET>
+填进 Spark 的地址: https://souls-app-sox-ericsson.trycloudflare.com/mcp/<MCP_SECRET>
+允许的 Host: [… , 'souls-app-sox-ericsson.trycloudflare.com', …]
+监听群: [123456789, 987654321]
+[自检] ✅ 隧道通了，握手成功（qq-digest 1.29.0）
+```
+
+最后那行是**自检**：本地端口起来之后，`launch.py` 会朝自己的公网地址真发一个 MCP `initialize`，确认能收到 `serverInfo`。本地日志只能证明进程活着，证明不了隧道通不通、`Host` 头过不过得了白名单——这一发能，而且失败时会直接说是哪种失败：
+
+| 现象 | 含义 |
+| --- | --- |
+| `421 Invalid Host header` | `PUBLIC_HOST` 跟 `Host` 头对不上，多半是多带了 `https://` 或末尾斜杠。 |
+| `404` | 密钥路径不对，检查 `MCP_SECRET`。 |
+| `SSL UNEXPECTED_EOF` / `502` / `530`，并在重试 | Cloudflare 边缘还没认这个新域名。会一直重试到 `SELFTEST_TIMEOUT`；临时隧道经常要 30 秒以上，所以默认给到 90。 |
+
+不想要就 `SELFTEST=0`。自检超时**不等于**启动失败——服务照常在跑，那条消息里会附一条 `curl`，等边缘生效之后自己再验一次就行。
+
+### 进程清理
+
+`launch.py`手底下有两个子进程：`cloudflared` 和服务端。哪个变成孤儿都挺烦——服务端孤儿会一直占着 8765（下次启动直接被端口检查拦下），`cloudflared` 孤儿则会继续挂着一条你以为已经关掉的隧道。
+
+正常退出和 Ctrl+C 由 `finally` 兜。但被强杀或者直接崩掉时 `finally` 是不会执行的，所以 Windows 上还额外把子进程挂进了一个带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 **Job Object**：父进程不管怎么死，句柄一关，内核就把 job 里的进程全部收掉，完全不需要我们的代码配合。已经拿 `taskkill /F` 单杀父进程验证过：两个子进程一起没，端口当场释放。
+
+非 Windows 上这段是空操作；job 建不起来的话会打条警告，退回到 `finally` 清理。
+
+Ctrl+C 会把隧道和服务一起收掉。**每次启动域名都会变**，所以 Spark 里的地址每次都得跟着改；想固定下来就用[具名隧道](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started-for-tunnels/)。
+
+`launch.py` 会在**开隧道之前**先查 `MCP_SECRET`、`WATCH_GROUPS` 和监听端口——变量没填、或者上一个实例还开着，都会当场退出，不会白开一条隧道。
+
+### Windows 下
+
+`run.bat` 把上面这一套包起来了。它**已被 gitignore**，因为里面存着你真实的 NapCat token——照下面的模板自己建一个：
+
+```bat
+@echo off
+chcp 65001 >nul
+set PYTHONIOENCODING=utf-8
+call mamba activate napcat
+set NAPCAT_URL=http://127.0.0.1:3000
+set NAPCAT_TOKEN=你在NapCat里设的token
+set WATCH_GROUPS=123456789,987654321
+set MCP_SECRET=你生成的那串hex
+python launch.py
+pause
+```
+
+三个容易踩的点：
+
+- **`call` 不能省。** `mamba activate` 本身就是个批处理脚本，不加 `call` 的话，bat 执行到这一行就把控制权交出去、直接退出了，后面的根本不跑。
+- **环境名要跟你实际建的那个对上。** 不写这行 activate，双击 `run.bat` 用的是 `PATH` 里第一个 `python`——通常是系统默认的那个解释器，然后 MCP 就 import 失败。
+- **`PYTHONIOENCODING=utf-8`。** `chcp 65001` 只管控制台；一旦输出被重定向（`run.bat > log.txt`，或者被计划任务拉起），Python 会退回系统 ANSI 代码页，启动横幅里的中文直接 `UnicodeEncodeError` 崩掉。加这一行就一劳永逸。
+
+另外**不要在这里再 `set PUBLIC_HOST`**——`launch.py` 会用当前隧道的域名把它覆盖掉。
+
+### 想自己管隧道
+
+不用 `launch.py` 也行，自己起隧道、把域名传进去：
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8765 --protocol http2
+export PUBLIC_HOST=<隧道域名>      # 裸域名，不要带 https://
+python qq_digest_mcp.py
+```
+
+`--protocol http2` 是 `launch.py` 的默认值。cloudflared 优先走 QUIC，那需要出站 UDP 7844，校园网和公司网经常封；http2 走 443，活下来的概率高得多。
+
+> **`PUBLIC_HOST` 必须是裸域名**（`abc-def.trycloudflare.com`），不是完整 URL。它会进 SDK 的 DNS 重绑定防护白名单，那里比对的是 `Host` 头；带上 `https://` 就永远匹配不上，所有请求都会变成 **`421 Invalid Host header`**。不填则只允许本机访问。
+
+填进 Spark 的地址 = 隧道域名 + 密钥路径：
+
+```
+https://<隧道域名>/mcp/<MCP_SECRET>
+```
+
+### 怎么找群号
+
+仓库里的 `groups.json` 就是 NapCat `get_group_list` 的一份返回存档，填 `WATCH_GROUPS` 时可以拿它按群名反查数字群号。想更新的话，对着自己的 NapCat 再调一次 `get_group_list` 覆盖掉就行。
+
+## 提供的工具
+
+| 工具 | 参数 | 返回 |
+| --- | --- | --- |
+| `list_watched_groups` | — | 白名单内每个群的群号、群名、人数。做简报前先调它拿群号。 |
+| `get_group_messages` | `group_id`、`count`（默认 200，上限 300） | 单个群清洗后的聊天记录。 |
+| `get_my_mentions` | `hours`（默认 24）、`count`（默认 200） | 跨所有白名单群，找出 @ 过我的消息，每条附带前后各一条上下文。 |
+
+## 配置
+
+环境变量：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `NAPCAT_URL` | `http://127.0.0.1:3000` | NapCat 的 OneBot v11 HTTP 地址。 |
+| `NAPCAT_TOKEN` | *（空）* | 以 `Authorization: Bearer …` 发给 NapCat。 |
+| `MCP_SECRET` | **必填** | 随机 hex，当作 URL 里的密钥路径。不填直接退出。 |
+| `WATCH_GROUPS` | **必填** | 逗号分隔的群号。不填直接退出。 |
+| `BIND_HOST` | `127.0.0.1` | 监听地址。留在回环上，对外暴露交给隧道。 |
+| `BIND_PORT` | `8765` | 监听端口。 |
+| `MCP_BEARER` | *（未设）* | 设了之后，请求还必须带上匹配的 `Authorization: Bearer` 头。 |
+| `PUBLIC_HOST` | *（未设）* | 公网裸域名，会加进 DNS 重绑定白名单。由 `launch.py` 自动填；不填则只允许本机访问。 |
+| `ENABLE_OCR` | `1` | 设成 `0` 就完全跳过图片 OCR。 |
+| `OCR_PER_CALL` | `15` | 单次请求最多识别几张图。 |
+
+只有 `launch.py` 会读的：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `CLOUDFLARED` | `cloudflared` | 可执行文件名或绝对路径，走 `PATH` 查找。 |
+| `TUNNEL_PROTOCOL` | `http2` | 传给 `cloudflared --protocol`。UDP 7844 通的话也可以换成 `quic`。 |
+| `TUNNEL_TIMEOUT` | `60` | 等隧道域名的秒数，超时就放弃。 |
+| `SELFTEST` | `1` | 设 `0` 跳过启动后的公网握手自检。 |
+| `SELFTEST_TIMEOUT` | `90` | 自检的超时秒数——等本地端口、重试公网请求各按这个值算。 |
+
+### 想自己手动验一下
+
+自检干的就是下面这一件事，你什么时候想验都可以自己发一发：
+
+```bash
+curl -i -X POST "https://<隧道域名>/mcp/<MCP_SECRET>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+正常的话是 `200`、`Content-Type: text/event-stream`，`data:` 那行里带着 `"serverInfo":{"name":"qq-digest",…}`。Windows 上如果 schannel 的吊销检查卡住，加个 `--ssl-no-revoke`。
+
+`qq_digest_mcp.py` 顶部的可调常量：
+
+| 常量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `MAX_COUNT` | `300` | 单次最多拉多少条原始消息。 |
+| `MAX_MSG_CHARS` | `400` | 单条消息截断长度。 |
+| `MIN_MSG_CHARS` | `2` | 短于此的正文直接丢。 |
+| `OCR_MAX_CHARS` | `600` | 单张图 OCR 文本截断长度。 |
+| `OCR_ROW_TOLERANCE` | `12` | 纵坐标差小于此值视为同一行。 |
+
+## 清洗流程做了什么
+
+原始的 OneBot 消息段在进模型之前要过好几道：
+
+- **去噪。** 纯表情、纯标点、纯语气词（「哈」「6」「awsl」）一律丢掉，短于 `MIN_MSG_CHARS` 的也丢。
+- **去复读。** 连续重复的消息只留一条。
+- **图片 OCR。** 群里的通知、课表、考试安排大多是图片，所以图片会走 NapCat 的 `ocr_image`（腾讯自家中文 OCR，免费、无本地依赖）。识别结果会按纵坐标**还原成行**、再按横坐标排序，表格才不会串成一行。结果按 `file_unique` 缓存，OCR 失败会被吞掉，不影响整条简报。
+- **卡片解包。** 群公告（`com.tencent.mannounce`）的正文是 base64，会先解开再给模型，而不是丢一串乱码过去。其它分享退化成 `[分享:标题]`。
+- **脱敏。** 手机号打码、身份证号屏蔽，`密码：xxx` / `token: xxx` 这类明文凭据在出服务端之前就被抹掉。
+- **提示注入围栏。** 聊天记录用 `<<<UNTRUSTED_CHAT_CONTENT … UNTRUSTED_CHAT_CONTENT>>>` 包起来，并明确声明里面的任何句子都不是指令；工具的 docstring 里也再说一遍。
+
+## 安全须知
+
+- **白名单是默认拒绝的。** `WATCH_GROUPS` 为空就什么都不给读——这是故意的，防手滑全量导出。`get_group_messages` 每次调用都会重新校验白名单，模型瞎猜群号也会被挡回去。
+- **端点有两层。** 密钥路径是强制的，`/mcp/<MCP_SECRET>` 以外的一律 404。如果 Spark 那边能带自定义 header，再设个 `MCP_BEARER` 当第二道。
+- **脱敏只是尽力而为。** 它覆盖常见形态，不是全部。默认简报的接收方是能看到群内容的。
+- 拿到隧道 URL 的人就能读你的白名单群。泄露了就换 `MCP_SECRET`（顺带换隧道）。
+
+## 已知限制
+
+- 每个群只能拿到最近 `count` 条，没有往前翻页的机制。
+- 「@我」判定跟着 NapCat 当前登录的账号走。
+- OCR 质量取决于腾讯；手写和低分辨率截图识别得比较糙。
+- `cloudflared tunnel --url` 每次跑都会给一个新的随机域名。想让 Spark 里的配置固定下来，用具名隧道。
