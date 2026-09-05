@@ -1,5 +1,6 @@
 # Holds the real NAPCAT_TOKEN and MCP_SECRET
-run.bat
+run_unnamed.bat
+run_named.bat
 
 # Dump of get_group_list — full group membership, including names and phone numbers
 groups.json

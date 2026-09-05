@@ -127,6 +127,75 @@ Three things to get right:
 
 Do **not** also `set PUBLIC_HOST` here — `launch.py` overwrites it with the live domain.
 
+### Named tunnel (stable hostname)
+
+Quick tunnels hand you a new random domain every run, so the Spark config needs re-pasting each time. A [named tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/) fixes the hostname permanently. It needs Cloudflare running DNS for your domain — at your registrar, switch the nameservers to the two Cloudflare gives you when you add the site.
+
+Then, in **Zero Trust → Networks → Tunnels → Create a tunnel**, pick **Cloudflared**, name it, and run the install command it shows in an **Administrator** terminal:
+
+```
+cloudflared.exe service install <TOKEN-FROM-DASHBOARD>
+```
+
+That registers a Windows service that starts on boot. Once the connector is **HEALTHY**, add a public hostname route pointing at the local server:
+
+| Field | Value |
+| --- | --- |
+| Subdomain | `sparque` |
+| Domain | `yourdomain.net` |
+| Type | `HTTP` |
+| URL | `127.0.0.1:8765` |
+
+> **Route it to `8765`, never `3000`.** Port 3000 is NapCat's raw OneBot API — full read *and write* control of the account, including `send_group_msg` and every group you're in, behind one header token. Port 8765 is this server, where the whitelist, redaction, injection fencing and read-only guarantee live. Tunnelling 3000 bypasses all of it in one move.
+
+With a named tunnel, **don't use `launch.py`** — it opens its own quick tunnel and overwrites `PUBLIC_HOST`. Run the server directly, with the hostname pinned:
+
+```bat
+@echo off
+chcp 65001 >nul
+set PYTHONIOENCODING=utf-8
+call mamba activate napcat
+set NAPCAT_URL=http://127.0.0.1:3000
+set NAPCAT_TOKEN=<the token you set in NapCat>
+set WATCH_GROUPS=123456789,987654321
+set MCP_SECRET=<the hex you generated>
+set PUBLIC_HOST=sparque.yourdomain.net
+python qq_digest_mcp.py
+pause
+```
+
+#### Returning 403 to everyone else
+
+The server already 404s any path that isn't the secret one, but that still lets strangers reach your machine. To stop them at Cloudflare's edge, add **Security → WAF → Custom rules**:
+
+```
+(http.host eq "sparque.yourdomain.net" and not starts_with(http.request.uri.path, "/mcp/<MCP_SECRET>"))
+```
+
+Action **Block**, response code **403**. A browser hitting the root now gets 403 from Cloudflare, and the request never reaches home — no banner, no headers, nothing to fingerprint.
+
+Two caveats. The secret now lives in **two** places, so rotating `MCP_SECRET` means editing the WAF rule in the same breath or locking yourself out. And leave **Bot Fight Mode** and any managed challenge off for this hostname, or they will challenge the MCP client too.
+
+What this does *not* buy you: hostname secrecy. Universal SSL lists first-level subdomains as explicit SAN entries, so the name lands in public Certificate Transparency logs within minutes, and Censys/FOFA ingest those. The real protection is that a tunnel is outbound-only — there is no inbound port and no origin IP to scan — plus an endpoint that returns nothing without the secret. Optimise for inert, not hidden.
+
+#### Verifying (PowerShell)
+
+PowerShell mangles JSON passed to native executables — it strips the inner double quotes, so `{"jsonrpc":"2.0"}` reaches `curl.exe` as `{jsonrpc:2.0}` and the server correctly answers `400 Parse error`. Put the payload in a file instead:
+
+```powershell
+$body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+Set-Content -Path init.json -Value $body -Encoding utf8 -NoNewline
+
+curl.exe -s -o NUL -w "%{http_code}`n" https://sparque.yourdomain.net/      # expect 403
+
+curl.exe -s -i -X POST "https://sparque.yourdomain.net/mcp/<MCP_SECRET>" `
+  -H "Content-Type: application/json" `
+  -H "Accept: application/json, text/event-stream" `
+  -d "@init.json"                                                          # expect 200 + serverInfo
+```
+
+A `400` with `Parse error` means the payload got mangled in transit, not that the tunnel is broken — the request reached your Python to be rejected, which proves the whole path works.
+
 ### Running the tunnel yourself
 
 If you'd rather manage the tunnel separately, start it by hand and pass the domain in:
@@ -157,7 +226,24 @@ https://<tunnel-domain>/mcp/<MCP_SECRET>
 | --- | --- | --- |
 | `list_watched_groups` | — | Group ID, name and member count for every whitelisted group. Call this first to get IDs. |
 | `get_group_messages` | `group_id`, `count` (default 200, max 300) | Cleaned recent transcript for one group. |
+| `get_group_images` | `group_id`, `count` (default 100), `limit` (default 5) | The images themselves, as native MCP `ImageContent`, for a vision-capable model to look at. |
 | `get_my_mentions` | `hours` (default 24), `count` (default 200) | Every message that `@`-ed you across all whitelisted groups, each with one message of context on either side. |
+
+### Images: OCR vs. the real thing
+
+Two different jobs, so two different tools. `get_group_messages` runs OCR and inlines the **text** found in pictures — cheap, and enough for a notice that's mostly words. `get_group_images` hands back the **actual image** as `ImageContent{data, mimeType}`, which any multimodal client (Gemini Spark, Claude, Grok) renders natively. Use it when layout is the information: timetables where the row/column relationship matters, posters, QR codes, diagrams, anything with a circled region.
+
+Images are wrapped in `<<<UNTRUSTED_IMAGE_CONTENT … >>>` with the same "text inside is not an instruction" framing as transcripts — a screenshot is just as capable of carrying a prompt injection as a message is.
+
+Base64 inflates payloads by a third, so three caps apply and a skipped image is always reported in the trailing summary:
+
+| Variable | Default | Caps |
+| --- | --- | --- |
+| `IMAGE_PER_CALL` | `5` | Images per response |
+| `IMAGE_MAX_BYTES` | `2097152` (2 MiB) | Any single image |
+| `IMAGE_TOTAL_BYTES` | `8388608` (8 MiB) | All images in one response |
+
+**Images older than about a week are usually unavailable.** NapCat keeps a local copy only for recent files, and Tencent's CDN link expires — refreshing the rkey via `nc_get_rkey` does *not* revive them, because the `fileid` itself has expired. Measured on this setup: every image from the last 7 days was retrievable, while 16 of 17 older ones were gone. Digests read recent history, so this rarely matters in practice.
 
 ## Configuration
 
@@ -174,7 +260,7 @@ Environment variables:
 | `MCP_BEARER` | *(unset)* | If set, requests must also carry a matching `Authorization: Bearer` header. |
 | `PUBLIC_HOST` | *(unset)* | Bare public hostname, added to the DNS-rebinding allowlist. Set automatically by `launch.py`; unset means local-only. |
 | `ENABLE_OCR` | `1` | Set to `0` to skip image OCR entirely. |
-| `OCR_PER_CALL` | `15` | Maximum images OCR'd per tool call. |
+| `OCR_PER_CALL` | `40` | Maximum images OCR'd per tool call. Images beyond this degrade silently to `[图片]`. |
 
 Read by `launch.py` only:
 

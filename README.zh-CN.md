@@ -127,6 +127,75 @@ pause
 
 另外**不要在这里再 `set PUBLIC_HOST`**——`launch.py` 会用当前隧道的域名把它覆盖掉。
 
+### 具名隧道（固定域名）
+
+临时隧道每跑一次换一个随机域名，Spark 里的地址就得重贴一次。[具名隧道](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/)能把域名固定下来。前提是 DNS 得交给 Cloudflare 托管——在域名注册商那边，把 nameserver 改成 Cloudflare 添加站点时给的那两个。
+
+然后在 **Zero Trust → Networks → Tunnels → Create a tunnel** 里选 **Cloudflared**、起个名字，把它给的安装命令用**管理员**终端跑一遍：
+
+```
+cloudflared.exe service install <面板里给的TOKEN>
+```
+
+这会注册一个开机自启的 Windows 服务。等连接器变成 **HEALTHY**，再加一条 public hostname 路由指向本地服务：
+
+| 字段 | 值 |
+| --- | --- |
+| Subdomain | `sparque` |
+| Domain | `yourdomain.net` |
+| Type | `HTTP` |
+| URL | `127.0.0.1:8765` |
+
+> **只能指向 `8765`，绝对不要指 `3000`。** 3000 是 NapCat 的原始 OneBot 接口——对账号有完整的读**写**权限，`send_group_msg`、你在的每一个群都在里面，前面只挡着一个 header token。8765 才是本服务，白名单、脱敏、注入围栏、只读保证全都住在这一层。把 3000 挂出去，等于一步把这些全绕过。
+
+用了具名隧道就**别再用 `launch.py`**——它会自己开一条临时隧道，还会把 `PUBLIC_HOST` 覆盖掉。直接跑服务、把域名钉死：
+
+```bat
+@echo off
+chcp 65001 >nul
+set PYTHONIOENCODING=utf-8
+call mamba activate napcat
+set NAPCAT_URL=http://127.0.0.1:3000
+set NAPCAT_TOKEN=你在NapCat里设的token
+set WATCH_GROUPS=123456789,987654321
+set MCP_SECRET=你生成的那串hex
+set PUBLIC_HOST=sparque.yourdomain.net
+python qq_digest_mcp.py
+pause
+```
+
+#### 让其他人都吃 403
+
+服务端本来就会把非密钥路径 404 掉，但那样陌生人的请求还是能打到你机器上。想让他们在 Cloudflare 边缘就被拦下，加一条 **Security → WAF → Custom rules**：
+
+```
+(http.host eq "sparque.yourdomain.net" and not starts_with(http.request.uri.path, "/mcp/<MCP_SECRET>"))
+```
+
+动作选 **Block**，响应码 **403**。这样浏览器打根路径直接被 Cloudflare 403，请求根本到不了家里——没有 banner、没有响应头，没有任何可以指纹识别的东西。
+
+两个注意点。密钥现在存在**两个**地方了，以后轮换 `MCP_SECRET` 必须同时改 WAF 规则，否则就是把自己锁在外面。另外这个域名上的 **Bot Fight Mode** 和各类 managed challenge 都要关掉，不然它们会连 MCP 客户端一起挑战。
+
+这套**换不来**的东西是：域名保密。Universal SSL 会把一级子域名以明确的 SAN 条目写进证书，所以域名几分钟内就会出现在公开的证书透明度（CT）日志里，Censys、FOFA 都在吃这个源。真正保护你的是隧道本身是出站连接——没有入站端口、没有源站 IP 可扫——外加一个不给密钥就什么都不吐的端点。要的是"打不开"，不是"找不到"。
+
+#### 怎么验（PowerShell）
+
+PowerShell 往原生 exe 传参会吞掉里层的双引号，`{"jsonrpc":"2.0"}` 到 `curl.exe` 手里就变成了 `{jsonrpc:2.0}`，服务端于是正确地回 `400 Parse error`。把 body 写进文件再传：
+
+```powershell
+$body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+Set-Content -Path init.json -Value $body -Encoding utf8 -NoNewline
+
+curl.exe -s -o NUL -w "%{http_code}`n" https://sparque.yourdomain.net/      # 应该是 403
+
+curl.exe -s -i -X POST "https://sparque.yourdomain.net/mcp/<MCP_SECRET>" `
+  -H "Content-Type: application/json" `
+  -H "Accept: application/json, text/event-stream" `
+  -d "@init.json"                                                          # 应该是 200 + serverInfo
+```
+
+看到 `400 Parse error` 不代表隧道坏了，恰恰相反：请求已经打到你的 Python 才被拒的，这说明整条链路是通的。
+
 ### 想自己管隧道
 
 不用 `launch.py` 也行，自己起隧道、把域名传进去：
@@ -157,7 +226,24 @@ https://<隧道域名>/mcp/<MCP_SECRET>
 | --- | --- | --- |
 | `list_watched_groups` | — | 白名单内每个群的群号、群名、人数。做简报前先调它拿群号。 |
 | `get_group_messages` | `group_id`、`count`（默认 200，上限 300） | 单个群清洗后的聊天记录。 |
+| `get_group_images` | `group_id`、`count`（默认 100）、`limit`（默认 5） | 图片原图，以 MCP 原生 `ImageContent` 返回，交给多模态模型自己看。 |
 | `get_my_mentions` | `hours`（默认 24）、`count`（默认 200） | 跨所有白名单群，找出 @ 过我的消息，每条附带前后各一条上下文。 |
+
+### 图片：OCR 和原图是两件事
+
+两种活，所以两个工具。`get_group_messages` 走 OCR，把图里的**文字**抠出来塞进正文——便宜，对付以文字为主的通知够用。`get_group_images` 返回的是**图片本身**（`ImageContent{data, mimeType}`），任何多模态客户端（Gemini Spark、Claude、Grok）都能直接看。什么时候用它：版式本身就是信息的时候——课表这种行列对应关系要紧的、海报、二维码、示意图、圈了某一块的截图。
+
+图片同样用 `<<<UNTRUSTED_IMAGE_CONTENT … >>>` 框起来，跟聊天记录一个待遇：截图里塞提示注入和消息里塞是一样容易的。
+
+base64 会让体积涨三分之一，所以卡了三道；被跳过的图会在结尾的汇总里说明：
+
+| 变量 | 默认值 | 限制 |
+| --- | --- | --- |
+| `IMAGE_PER_CALL` | `5` | 单次返回几张 |
+| `IMAGE_MAX_BYTES` | `2097152`（2 MiB） | 单张体积 |
+| `IMAGE_TOTAL_BYTES` | `8388608`（8 MiB） | 单次合计体积 |
+
+**超过一周左右的图基本就取不回来了。** NapCat 只对近期文件留本地副本，腾讯的 CDN 链接也会过期——而且用 `nc_get_rkey` 换个新 rkey 也救不回来，因为过期的是 `fileid` 本身。在这台机器上实测：最近 7 天的图全都能取到，更早的 17 张里有 16 张已经没了。简报读的都是近期消息，所以实际用起来很少碰到。
 
 ## 配置
 
@@ -174,7 +260,7 @@ https://<隧道域名>/mcp/<MCP_SECRET>
 | `MCP_BEARER` | *（未设）* | 设了之后，请求还必须带上匹配的 `Authorization: Bearer` 头。 |
 | `PUBLIC_HOST` | *（未设）* | 公网裸域名，会加进 DNS 重绑定白名单。由 `launch.py` 自动填；不填则只允许本机访问。 |
 | `ENABLE_OCR` | `1` | 设成 `0` 就完全跳过图片 OCR。 |
-| `OCR_PER_CALL` | `15` | 单次请求最多识别几张图。 |
+| `OCR_PER_CALL` | `40` | 单次请求最多识别几张图。超出的图会静默退化成 `[图片]`。 |
 
 只有 `launch.py` 会读的：
 
