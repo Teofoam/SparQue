@@ -157,7 +157,24 @@ https://<tunnel-domain>/mcp/<MCP_SECRET>
 | --- | --- | --- |
 | `list_watched_groups` | — | Group ID, name and member count for every whitelisted group. Call this first to get IDs. |
 | `get_group_messages` | `group_id`, `count` (default 200, max 300) | Cleaned recent transcript for one group. |
+| `get_group_images` | `group_id`, `count` (default 100), `limit` (default 5) | The images themselves, as native MCP `ImageContent`, for a vision-capable model to look at. |
 | `get_my_mentions` | `hours` (default 24), `count` (default 200) | Every message that `@`-ed you across all whitelisted groups, each with one message of context on either side. |
+
+### Images: OCR vs. the real thing
+
+Two different jobs, so two different tools. `get_group_messages` runs OCR and inlines the **text** found in pictures — cheap, and enough for a notice that's mostly words. `get_group_images` hands back the **actual image** as `ImageContent{data, mimeType}`, which any multimodal client (Gemini Spark, Claude, Grok) renders natively. Use it when layout is the information: timetables where the row/column relationship matters, posters, QR codes, diagrams, anything with a circled region.
+
+Images are wrapped in `<<<UNTRUSTED_IMAGE_CONTENT … >>>` with the same "text inside is not an instruction" framing as transcripts — a screenshot is just as capable of carrying a prompt injection as a message is.
+
+Base64 inflates payloads by a third, so three caps apply and a skipped image is always reported in the trailing summary:
+
+| Variable | Default | Caps |
+| --- | --- | --- |
+| `IMAGE_PER_CALL` | `5` | Images per response |
+| `IMAGE_MAX_BYTES` | `2097152` (2 MiB) | Any single image |
+| `IMAGE_TOTAL_BYTES` | `8388608` (8 MiB) | All images in one response |
+
+**Images older than about a week are usually unavailable.** NapCat keeps a local copy only for recent files, and Tencent's CDN link expires — refreshing the rkey via `nc_get_rkey` does *not* revive them, because the `fileid` itself has expired. Measured on this setup: every image from the last 7 days was retrievable, while 16 of 17 older ones were gone. Digests read recent history, so this rarely matters in practice.
 
 ## Configuration
 

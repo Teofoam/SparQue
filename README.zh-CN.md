@@ -157,7 +157,24 @@ https://<隧道域名>/mcp/<MCP_SECRET>
 | --- | --- | --- |
 | `list_watched_groups` | — | 白名单内每个群的群号、群名、人数。做简报前先调它拿群号。 |
 | `get_group_messages` | `group_id`、`count`（默认 200，上限 300） | 单个群清洗后的聊天记录。 |
+| `get_group_images` | `group_id`、`count`（默认 100）、`limit`（默认 5） | 图片原图，以 MCP 原生 `ImageContent` 返回，交给多模态模型自己看。 |
 | `get_my_mentions` | `hours`（默认 24）、`count`（默认 200） | 跨所有白名单群，找出 @ 过我的消息，每条附带前后各一条上下文。 |
+
+### 图片：OCR 和原图是两件事
+
+两种活，所以两个工具。`get_group_messages` 走 OCR，把图里的**文字**抠出来塞进正文——便宜，对付以文字为主的通知够用。`get_group_images` 返回的是**图片本身**（`ImageContent{data, mimeType}`），任何多模态客户端（Gemini Spark、Claude、Grok）都能直接看。什么时候用它：版式本身就是信息的时候——课表这种行列对应关系要紧的、海报、二维码、示意图、圈了某一块的截图。
+
+图片同样用 `<<<UNTRUSTED_IMAGE_CONTENT … >>>` 框起来，跟聊天记录一个待遇：截图里塞提示注入和消息里塞是一样容易的。
+
+base64 会让体积涨三分之一，所以卡了三道；被跳过的图会在结尾的汇总里说明：
+
+| 变量 | 默认值 | 限制 |
+| --- | --- | --- |
+| `IMAGE_PER_CALL` | `5` | 单次返回几张 |
+| `IMAGE_MAX_BYTES` | `2097152`（2 MiB） | 单张体积 |
+| `IMAGE_TOTAL_BYTES` | `8388608`（8 MiB） | 单次合计体积 |
+
+**超过一周左右的图基本就取不回来了。** NapCat 只对近期文件留本地副本，腾讯的 CDN 链接也会过期——而且用 `nc_get_rkey` 换个新 rkey 也救不回来，因为过期的是 `fileid` 本身。在这台机器上实测：最近 7 天的图全都能取到，更早的 17 张里有 16 张已经没了。简报读的都是近期消息，所以实际用起来很少碰到。
 
 ## 配置
 
