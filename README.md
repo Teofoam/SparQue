@@ -260,7 +260,7 @@ Environment variables:
 | `MCP_BEARER` | *(unset)* | If set, requests must also carry a matching `Authorization: Bearer` header. |
 | `PUBLIC_HOST` | *(unset)* | Bare public hostname, added to the DNS-rebinding allowlist. Set automatically by `launch.py`; unset means local-only. |
 | `ENABLE_OCR` | `1` | Set to `0` to skip image OCR entirely. |
-| `OCR_PER_CALL` | `15` | Maximum images OCR'd per tool call. |
+| `OCR_PER_CALL` | `40` | Maximum images OCR'd per tool call. Images beyond this degrade silently to `[图片]`. |
 
 Read by `launch.py` only:
 

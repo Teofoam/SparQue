@@ -81,7 +81,7 @@ MIN_MSG_CHARS = 2        # 短于此的正文直接丢
 
 # 图片 OCR：走 NapCat 的 ocr_image（腾讯自家中文 OCR，免费、无本地依赖）
 ENABLE_OCR = os.environ.get("ENABLE_OCR", "1") == "1"
-OCR_PER_CALL = int(os.environ.get("OCR_PER_CALL", "15"))   # 单次请求最多识别几张图
+OCR_PER_CALL = int(os.environ.get("OCR_PER_CALL", "40"))   # 单次请求最多识别几张图
 OCR_MAX_CHARS = 600      # 单张图 OCR 文本截断长度
 OCR_ROW_TOLERANCE = 12   # 纵坐标差小于此值视为同一行（用来还原表格）
 
