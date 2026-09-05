@@ -98,7 +98,7 @@ Normal exit and Ctrl+C are handled by a `finally` block. That block can't help i
 
 Elsewhere it's a no-op, and if the job can't be created `launch.py` warns and falls back to the `finally` cleanup.
 
-Ctrl+C stops both. **The domain is new on every run**, so the Spark config needs updating each time — use a [named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started-for-tunnels/) if you want it to stay put.
+Ctrl+C stops both. **The domain is new on every run**, so the Spark config needs updating each time — use a [named tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/) if you want it to stay put.
 
 `launch.py` checks `MCP_SECRET`, `WATCH_GROUPS` and the listen port *before* opening the tunnel — an already-running instance or a missing variable fails immediately rather than burning a domain.
 

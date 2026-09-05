@@ -98,7 +98,7 @@ MCP endpoint: http://127.0.0.1:8765/mcp/<MCP_SECRET>
 
 非 Windows 上这段是空操作；job 建不起来的话会打条警告，退回到 `finally` 清理。
 
-Ctrl+C 会把隧道和服务一起收掉。**每次启动域名都会变**，所以 Spark 里的地址每次都得跟着改；想固定下来就用[具名隧道](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started-for-tunnels/)。
+Ctrl+C 会把隧道和服务一起收掉。**每次启动域名都会变**，所以 Spark 里的地址每次都得跟着改；想固定下来就用[具名隧道](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/)。
 
 `launch.py` 会在**开隧道之前**先查 `MCP_SECRET`、`WATCH_GROUPS` 和监听端口——变量没填、或者上一个实例还开着，都会当场退出，不会白开一条隧道。
 
