@@ -648,7 +648,12 @@ def format_transcript(group_name: str, messages: list[dict], raw_count: int) -> 
             last = m.get("last_ts")
             when = ""
             if last and last != m["ts"]:
-                when = datetime.fromtimestamp(last, DISPLAY_TZ).strftime("%H:%M")
+                # 行首的时间戳是这一段的【开始】。折叠段跨天时，只写 HH:MM 会被读成
+                # 和行首同一天——2026-09-06 实测 Gemini Spark 就把 09-06 18:20 的
+                # 接龙最终版报成了 09-05 18:20。跨天就把日期一起写出来。
+                end = datetime.fromtimestamp(last, DISPLAY_TZ)
+                start = datetime.fromtimestamp(m["ts"], DISPLAY_TZ)
+                when = end.strftime("%H:%M" if end.date() == start.date() else "%m-%d %H:%M")
             if m.get("chain"):
                 # 接龙不是复读：这几条内容各不相同，只是后一条包含前一条。
                 # 说成"发送相同内容"是错的，而且正文已经换成最完整的那版，得说清是谁发的。
