@@ -268,7 +268,24 @@ Base64 inflates payloads by a third, so three caps apply and a skipped image is 
 
 ### `count` is a ceiling, not a promise
 
-`get_group_msg_history` returns whatever NapCat has in the **local** QQ database, not the full history on Tencent's servers. Measured 2026-09-05: one group returned exactly 15 messages whether `count` was 20, 50, 100 or 300, and re-requesting with the oldest `message_seq` as an anchor returned the identical time span — so paging cannot reach further back. Messages that were never synced locally simply do not exist as far as this server is concerned.
+`get_group_msg_history` returns whatever NapCat has in the **local** QQ database, not the full history on Tencent's servers. Messages that were never synced locally do not exist as far as this server is concerned, and a busy group can burn its whole local window in an hour.
+
+How deep that window is depends on **`reverse_order`**, which this server now always sends. QQ NT's `getMsgsIncludeSelf` takes it as its 4th argument and defaults to `false`, meaning *search toward newer*. Since paging anchors on the oldest message already held, omitting it asks for "anything newer than the oldest I have" — which is everything already held. The paging loop then spins on the same batch forever. Measured 2026-09-06 on group 102942727, anchored at its oldest message:
+
+| `reverse_order` | Returned |
+| --- | --- |
+| omitted / `false` | 158 msgs, `05-30 → 09-06` — the anchor's own batch |
+| `true` | 1 msg at `05-30 15:07` — backward, correctly at the floor |
+
+Backward requests also make QQNT **materialise older messages into the local database**, and the effect persists. That is why a cold store — right after a re-login or a risk-profile reset — is where this matters most: plain `count` is capped at whatever little is materialised, and `reverse_order=true` is the only way to reach past it. Same store, cold, before and after:
+
+| Group | Without | With |
+| --- | --- | --- |
+| 102942727 | 14 msgs / 14.1 d | **158 msgs / 99.1 d** |
+| 1058503877 | 30 msgs / **1.0 h** | **299 msgs / 98.6 d** |
+| 1093527660 | 30 msgs / 0.2 d | **58 msgs / 83.3 d** |
+
+This is deeper, not unlimited — 339 messages spread over 98 days is still sparse. And it costs time: a group with 72 images took 4 s to fetch and 46 s to clean, mostly OCR attempts on images whose CDN links have long expired. Use `since_days` / `since` to bound the work when you do not need the full window.
 
 Read the first line of the response, not `count`, to know what you actually got: it states the covered time range and the number of distinct speakers.
 
@@ -347,7 +364,7 @@ Raw OneBot message segments go through several passes before the model sees them
 
 ## Limitations
 
-- Only the most recent `count` messages per group are reachable — there's no pagination back through history.
+- Per-group visibility is bounded by the depth of NapCat's local database. `reverse_order` pages backward and pulls more into it, but cannot reach past what Tencent roamed down in the first place.
 - The `@me` check resolves against whichever account NapCat is logged into.
 - OCR quality is Tencent's; handwriting and low-resolution screenshots come back rough.
 - `cloudflared tunnel --url` gives you a fresh random domain each run. Use a named tunnel if you want the Spark config to stay put.

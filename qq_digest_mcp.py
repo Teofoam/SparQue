@@ -441,23 +441,33 @@ def truncate_text(text: str, chain: bool = False) -> str:
 
 def fetch_history(group_id: int, count: int, cutoff_ts: float = 0) -> list[dict]:
     """
-    拉群历史，按需向前翻页，按 message_id 去重，返回时间升序。
+    拉群历史，向更早的方向翻页，按 message_id 去重，返回时间升序。
 
-    NapCat 的 get_group_msg_history 返回的是本地 QQ 数据库里缓存的那一段，
-    不是腾讯服务器上的全部历史。实测（2026-09-05）：
-      - count 给 20/50/100/300，某些群一律只回 15 条；
-      - 拿最老那条的 message_seq 当锚点再请求，回来的时间跨度完全一样，
-        多数群一条新的都没有。
-    所以翻页能捞回的东西有限——本地没缓存的消息，翻多少页也变不出来。
-    这里仍然翻，是因为确实有群第二页能多回几条（1093527660: 45 -> 52）；
-    但一旦某页没带来新 id 就立刻停，不然会对着同一批数据空转。
+    **reverse_order=True 是必传的。** QQ NT 的 getMsgsIncludeSelf 第 4 个参数
+    就是它，默认 false = 往【新】的方向查。而本函数的锚点恒等于当前已知最老
+    那条，所以不传的话每一页都在问"比最老那条更新的消息"，回来的永远是同一批，
+    翻页循环从来没有前进过一步。
+
+    实测（2026-09-06，群 102942727，锚点 = 最老的 05-30 15:07）：
+      - 不传 / False → 158 条，05-30 -> 09-06（就是锚点那批本身）
+      - True        →   1 条，05-30 15:07（锚点自己，本地已到底）
+    改对之后各群首屏深度（同一 store，冷库状态下对比）：
+      102942727  14 条/14.1 天 -> 158 条/99.1 天
+      1058503877 30 条/1.0 小时 -> 299 条/98.6 天
+
+    另一个副作用：reverse_order=True 的回溯请求会让 QQNT 把更早的消息物化到
+    本地库里，撑开之后连普通 count 都开始生效。所以冷库（刚扫码登录、或跑过
+    风控画像重置）时这个参数是唯一能往回捞的手段。
+
+    anchor=0 那次走的是 AIO 首屏分支（getAioFirstViewLatestMsgs），该参数会被
+    忽略，所以无条件传即可。末尾有 sorted(key=time)，顺序变化不影响下游。
     """
     collected: dict[Any, dict] = {}
     anchor = 0
 
     for _ in range(MAX_PAGES):
         page = napcat("get_group_msg_history", group_id=group_id,
-                      message_seq=anchor, count=count)
+                      message_seq=anchor, count=count, reverse_order=True)
         msgs = (page or {}).get("messages", []) if isinstance(page, dict) else (page or [])
         if not msgs:
             break
@@ -466,7 +476,7 @@ def fetch_history(group_id: int, count: int, cutoff_ts: float = 0) -> list[dict]
         for m in msgs:
             collected[m.get("message_id")] = m
         if not fresh:
-            break                      # 同一批数据，本地缓存到头了
+            break                      # 没有更早的了，本地库到底
 
         oldest = min(msgs, key=lambda m: m.get("time", 0))
         if cutoff_ts and oldest.get("time", 0) < cutoff_ts:
