@@ -169,10 +169,16 @@ pause
 The server already 404s any path that isn't the secret one, but that still lets strangers reach your machine. To stop them at Cloudflare's edge, add **Security → WAF → Custom rules**:
 
 ```
-(http.host eq "sparque.yourdomain.net" and not starts_with(http.request.uri.path, "/mcp/<MCP_SECRET>"))
+(http.host eq "<<<YOUR-HOSTNAME>>>" and not starts_with(http.request.uri.path, "/mcp/<<<YOUR-MCP-SECRET>>>"))
 ```
 
 Action **Block**, response code **403**. A browser hitting the root now gets 403 from Cloudflare, and the request never reaches home — no banner, no headers, nothing to fingerprint.
+
+> ### ⚠️ Substitute both placeholders, then prove the rule fires
+>
+> This rule **fails open**. Leave `<<<YOUR-HOSTNAME>>>` as-is and the expression is still syntactically valid: it saves without complaint and shows as **Active** in the dashboard, while matching nothing — no request ever carries that `Host`. There is no error state, no warning, nothing to notice. An unfired WAF rule looks exactly like a working one.
+>
+> So the rule is not done when it saves. It is done when you have watched a request get blocked. See [Verifying](#verifying-powershell) below — and note that the decisive signal is your **server console staying silent**, not the status code alone.
 
 Two caveats. The secret now lives in **two** places, so rotating `MCP_SECRET` means editing the WAF rule in the same breath or locking yourself out. And leave **Bot Fight Mode** and any managed challenge off for this hostname, or they will challenge the MCP client too.
 
@@ -186,13 +192,27 @@ PowerShell mangles JSON passed to native executables — it strips the inner dou
 $body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
 Set-Content -Path init.json -Value $body -Encoding utf8 -NoNewline
 
-curl.exe -s -o NUL -w "%{http_code}`n" https://sparque.yourdomain.net/      # expect 403
+# 1. a path that must be blocked at the edge — expect 403
+curl.exe -s -o NUL -w "%{http_code}`n" "https://<<<YOUR-HOSTNAME>>>/foo"
 
-curl.exe -s -i -X POST "https://sparque.yourdomain.net/mcp/<MCP_SECRET>" `
+# 2. the secret path — expect 200. A rule that blocks this locks Spark out too.
+curl.exe -s -i -X POST "https://<<<YOUR-HOSTNAME>>>/mcp/<<<YOUR-MCP-SECRET>>>" `
   -H "Content-Type: application/json" `
   -H "Accept: application/json, text/event-stream" `
-  -d "@init.json"                                                          # expect 200 + serverInfo
+  -d "@init.json"
 ```
+
+**Keep the server console visible while you run check 1.** The status code alone cannot tell you who answered; the console can.
+
+| Check 1 result | Console | Meaning |
+| --- | --- | --- |
+| `403` | **no new line** | Working. Killed at the edge; it never reached you. |
+| `404` | `GET /foo … 404 Not Found` | **Rule is not firing.** Placeholder left in, or the hostname does not match. |
+| `403` | new line appears | Not the WAF — something on your side returned 403. |
+
+If you want to be certain which 403 you got, look at the body: Cloudflare serves ~4.5 KB of HTML containing `Sorry, you have been blocked`, whereas this server would answer with a 21-byte `{"error":"not found"}`.
+
+Check 2 returning `403` means the opposite failure — the secret in the rule does not match the one in your launcher, so the rule is blocking Spark as well.
 
 A `400` with `Parse error` means the payload got mangled in transit, not that the tunnel is broken — the request reached your Python to be rejected, which proves the whole path works.
 
@@ -310,7 +330,7 @@ Tunables at the top of `qq_digest_mcp.py`:
 
 Raw OneBot message segments go through several passes before the model sees them:
 
-- **Noise removal.** Pure emoji, punctuation, and filler ("哈", "6", "awsl") are dropped, as are messages shorter than `MIN_MSG_CHARS`.
+- **Noise removal.** Pure emoji, punctuation, and filler ("哈", "6", "QAQ") are dropped, as are messages shorter than `MIN_MSG_CHARS`.
 - **De-duplication.** Consecutive identical messages (复读) collapse to one. Comparison uses the **untruncated** body — folding on truncated text used to merge messages that differed only past `MAX_MSG_CHARS`.
 - **Chain collapse (接龙).** A 接龙 is cumulative: each message is the previous one plus one more name. When a message is a strict prefix-extension of the one before it, the run collapses to its **last** member — the only complete copy — and the annotation says `接龙链` rather than "sent the same content", crediting the final text to whoever actually posted it. Measured on a real group: 29 messages, 41 names, previously rendered as entries 1–18 with a false repeat count.
 - **Image OCR.** Group notices, timetables and exam schedules are usually screenshots, so images are run through NapCat's `ocr_image` (Tencent's own Chinese OCR — free, no local dependency). Results are **reassembled into rows** by Y-coordinate and sorted by X, so tables survive as tables instead of collapsing into one line. Results are cached by `file_unique`, and OCR failures are swallowed rather than failing the digest.

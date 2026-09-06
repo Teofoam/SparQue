@@ -169,10 +169,16 @@ pause
 服务端本来就会把非密钥路径 404 掉，但那样陌生人的请求还是能打到你机器上。想让他们在 Cloudflare 边缘就被拦下，加一条 **Security → WAF → Custom rules**：
 
 ```
-(http.host eq "sparque.yourdomain.net" and not starts_with(http.request.uri.path, "/mcp/<MCP_SECRET>"))
+(http.host eq "<<<YOUR-HOSTNAME>>>" and not starts_with(http.request.uri.path, "/mcp/<<<YOUR-MCP-SECRET>>>"))
 ```
 
 动作选 **Block**，响应码 **403**。这样浏览器打根路径直接被 Cloudflare 403，请求根本到不了家里——没有 banner、没有响应头，没有任何可以指纹识别的东西。
+
+> ### ⚠️ 两个占位符都要替换掉，然后必须实测规则真的生效
+>
+> 这条规则是**静默失效**的。`<<<YOUR-HOSTNAME>>>` 不替换，表达式在语法上照样成立：保存不报错，面板里显示 **Active**，但它谁都匹配不上——没有任何请求的 `Host` 是这个值。没有报错、没有告警，什么异常都看不到。一条从不触发的 WAF 规则，长得和正常工作的一模一样。
+>
+> 所以规则保存了不算完，**看到一个请求被拦下来**才算完。做法见下面的[怎么验](#怎么验powershell)——真正的判据是**服务端控制台没有新日志**，光看状态码不够。
 
 两个注意点。密钥现在存在**两个**地方了，以后轮换 `MCP_SECRET` 必须同时改 WAF 规则，否则就是把自己锁在外面。另外这个域名上的 **Bot Fight Mode** 和各类 managed challenge 都要关掉，不然它们会连 MCP 客户端一起挑战。
 
@@ -186,13 +192,27 @@ PowerShell 往原生 exe 传参会吞掉里层的双引号，`{"jsonrpc":"2.0"}`
 $body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
 Set-Content -Path init.json -Value $body -Encoding utf8 -NoNewline
 
-curl.exe -s -o NUL -w "%{http_code}`n" https://sparque.yourdomain.net/      # 应该是 403
+# 1. 必须在边缘就被拦掉的路径——应该是 403
+curl.exe -s -o NUL -w "%{http_code}`n" "https://<<<YOUR-HOSTNAME>>>/foo"
 
-curl.exe -s -i -X POST "https://sparque.yourdomain.net/mcp/<MCP_SECRET>" `
+# 2. 密钥路径——应该是 200。把这个也拦了的规则，等于把 Spark 一起锁在外面。
+curl.exe -s -i -X POST "https://<<<YOUR-HOSTNAME>>>/mcp/<<<YOUR-MCP-SECRET>>>" `
   -H "Content-Type: application/json" `
   -H "Accept: application/json, text/event-stream" `
-  -d "@init.json"                                                          # 应该是 200 + serverInfo
+  -d "@init.json"
 ```
+
+**跑第 1 条的时候把服务端控制台放在看得见的地方。** 状态码本身说明不了是谁回的，控制台可以。
+
+| 第 1 条的结果 | 控制台 | 含义 |
+| --- | --- | --- |
+| `403` | **没有新日志** | 正常。请求在边缘就死了，根本没到你这儿。 |
+| `404` | 冒出 `GET /foo … 404 Not Found` | **规则没生效。** 占位符没换，或者域名对不上。 |
+| `403` | 冒出新日志 | 那不是 WAF——是你自己这边回的 403。 |
+
+想确认这个 403 到底是谁给的，看响应体：Cloudflare 会回大约 4.5 KB 的 HTML，里面有 `Sorry, you have been blocked`；而本服务只会回 21 字节的 `{"error":"not found"}`。
+
+第 2 条如果是 `403`，那是反过来错了——规则里的密钥和启动脚本里的对不上，Spark 也一起被拦了。
 
 看到 `400 Parse error` 不代表隧道坏了，恰恰相反：请求已经打到你的 Python 才被拒的，这说明整条链路是通的。
 
@@ -310,7 +330,7 @@ curl -i -X POST "https://<隧道域名>/mcp/<MCP_SECRET>" \
 
 原始的 OneBot 消息段在进模型之前要过好几道：
 
-- **去噪。** 纯表情、纯标点、纯语气词（「哈」「6」「awsl」）一律丢掉，短于 `MIN_MSG_CHARS` 的也丢。
+- **去噪。** 纯表情、纯标点、纯语气词（「哈」「6」「QAQ」）一律丢掉，短于 `MIN_MSG_CHARS` 的也丢。
 - **去复读。** 连续重复的消息只留一条。比对用的是**未截断**的正文——先截后比会把只在 `MAX_MSG_CHARS` 之后才不同的消息误判成相同。
 - **接龙折叠。** 接龙是累积型消息：每条都是上一条再加一个名字。后一条是前一条的严格前缀扩展时，整串折成**最后一条**——唯一完整的那份——并标注为「接龙链」而不是「发送相同内容」，正文归到真正发出它的人名下。实测某群：29 条消息、41 个名字，旧逻辑只呈现第 1～18 项，还附带一个错误的复读人数。
 - **图片 OCR。** 群里的通知、课表、考试安排大多是图片，所以图片会走 NapCat 的 `ocr_image`（腾讯自家中文 OCR，免费、无本地依赖）。识别结果会按纵坐标**还原成行**、再按横坐标排序，表格才不会串成一行。结果按 `file_unique` 缓存，OCR 失败会被吞掉，不影响整条简报。
