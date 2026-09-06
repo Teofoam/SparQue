@@ -86,6 +86,10 @@ MIN_MSG_CHARS = 2        # 短于此的正文直接丢
 ENABLE_OCR = os.environ.get("ENABLE_OCR", "1") == "1"
 OCR_PER_CALL = int(os.environ.get("OCR_PER_CALL", "40"))   # 单次请求最多识别几张图
 OCR_MAX_CHARS = 600      # 单张图 OCR 文本截断长度
+# 超过这个天数的图直接不识别。0 = 不限。
+# 腾讯 CDN 对老图的链接会失效，且 rkey 换新也救不回来（过期的是 fileid 本身），
+# 所以老图必然识别失败，只是失败前要各跑一次 get_image 和 ocr_image。
+OCR_MAX_AGE_DAYS = float(os.environ.get("OCR_MAX_AGE_DAYS", "7"))
 OCR_ROW_TOLERANCE = 12   # 纵坐标差小于此值视为同一行（用来还原表格）
 
 # 原图直传：把图片本身交给多模态模型看，而不是只喂 OCR 出来的文字。
@@ -142,6 +146,7 @@ def self_id() -> int:
 
 _ocr_cache: dict[str, str] = {}   # file_unique -> 识别结果，避免同一张图反复识别
 _ocr_failed_once = False          # 只提示第一次失败，不然刷屏
+_ocr_skipped_old_once = False     # 同上，按龄跳过也只提示一次
 
 
 def _reconstruct_rows(items: list[dict]) -> str:
@@ -224,9 +229,30 @@ def _resolve_image_target(data: dict) -> str:
     return str(data.get("url") or "")
 
 
-def ocr_image(data: dict, budget: list[int]) -> str:
-    """对单张图片做 OCR。budget 是可变计数器，用完就不再识别。"""
+def ocr_image(data: dict, budget: list[int], msg_ts: float = 0) -> str:
+    """
+    对单张图片做 OCR。budget 是可变计数器，用完就不再识别。
+
+    msg_ts 是这条消息的时间戳，用来按龄跳过老图——见 OCR_MAX_AGE_DAYS。
+    传 0（默认）就不做年龄判断。
+    """
     if not ENABLE_OCR or budget[0] <= 0:
+        return ""
+
+    # 老图先拦掉，别等它失败。加了 reverse_order 之后能拉到 90 多天前的历史，
+    # 老图占比一下就上来了：实测某群 72 张图，清洗耗时 45.5 秒，几乎全花在
+    # 对早已失效的 CDN 链接反复 get_image + ocr_image 上。
+    # 这里不扣 budget——跳过的图本来也识别不出来，不该占用当次的识别额度。
+    if OCR_MAX_AGE_DAYS and msg_ts and (time.time() - msg_ts) > OCR_MAX_AGE_DAYS * 86400:
+        global _ocr_skipped_old_once
+        if not _ocr_skipped_old_once:
+            _ocr_skipped_old_once = True
+            print(
+                f"[OCR] 跳过超过 {OCR_MAX_AGE_DAYS:g} 天的图片（之后不再重复提示）："
+                f"这类图的 CDN 链接已失效，识别必然失败。要改用 OCR_MAX_AGE_DAYS。",
+                file=sys.stderr,
+                flush=True,
+            )
         return ""
 
     key = data.get("file_unique") or data.get("file_id") or data.get("file") or ""
@@ -369,7 +395,9 @@ def render_card(raw: str) -> str:
     return f"[分享:{m.group(1)}]" if m else "[卡片]"
 
 
-def render_segments(segments: Any, ocr_budget: list[int] | None = None) -> tuple[str, list[int]]:
+def render_segments(
+    segments: Any, ocr_budget: list[int] | None = None, msg_ts: float = 0
+) -> tuple[str, list[int]]:
     """把 OneBot array 格式的消息段压成一行纯文本，同时返回被 @ 的 QQ 号。"""
     ocr_budget = ocr_budget if ocr_budget is not None else [0]
     if isinstance(segments, str):
@@ -397,7 +425,7 @@ def render_segments(segments: Any, ocr_budget: list[int] | None = None) -> tuple
             parts.append("[回复]")
         elif stype == "image":
             # 群里的通知、课表、考试安排大多是图片，靠 OCR 才能进简报
-            recognized = ocr_image(data, ocr_budget)
+            recognized = ocr_image(data, ocr_budget, msg_ts)
             if recognized:
                 parts.append(f"[图片内容↓\n{recognized}\n图片内容↑]")
             else:
@@ -520,7 +548,9 @@ def clean_history(raw_messages: list[dict]) -> tuple[list[dict], int]:
     ocr_budget = [OCR_PER_CALL]
 
     for msg in raw_messages:
-        text, mentioned = render_segments(msg.get("message"), ocr_budget)
+        text, mentioned = render_segments(
+            msg.get("message"), ocr_budget, msg.get("time", 0)
+        )
 
         if len(text) < MIN_MSG_CHARS or _NOISE_RE.match(text):
             continue

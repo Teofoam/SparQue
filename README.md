@@ -264,7 +264,16 @@ Base64 inflates payloads by a third, so three caps apply and a skipped image is 
 | `IMAGE_MAX_BYTES` | `2097152` (2 MiB) | Any single image |
 | `IMAGE_TOTAL_BYTES` | `8388608` (8 MiB) | All images in one response |
 
-**Images older than about a week are usually unavailable.** NapCat keeps a local copy only for recent files, and Tencent's CDN link expires — refreshing the rkey via `nc_get_rkey` does *not* revive them, because the `fileid` itself has expired. Measured on this setup: every image from the last 7 days was retrievable, while 16 of 17 older ones were gone. Digests read recent history, so this rarely matters in practice.
+**Images older than about a week are usually unavailable.** NapCat keeps a local copy only for recent files, and Tencent's CDN link expires — refreshing the rkey via `nc_get_rkey` does *not* revive them, because the `fileid` itself has expired. Measured on this setup: every image from the last 7 days was retrievable, while 16 of 17 older ones were gone. Since `reverse_order` deepened the reachable history, old images are now common rather than rare.
+
+So images older than `OCR_MAX_AGE_DAYS` (7) are skipped before any network call, and **without consuming OCR budget** — an expired image fails anyway, and letting it take a budget slot starves a fresh one. Measured on group 1093527660 (52 images, 18 older than 7 days):
+
+| | OCR attempted | Succeeded | Lines kept |
+| --- | --- | --- | --- |
+| Without the age check | 40 (whole budget) | 22 | 28 |
+| With it | 34 | **34** | **40** |
+
+Those 12 extra lines are not rounding. An image-only message whose OCR fails degrades to `[图片]`, which the noise filter then drops — so the message was disappearing from the digest entirely. Groups whose images are all old benefit most on time: one went from 45.5 s of cleaning to 0.0 s.
 
 ### `count` is a ceiling, not a promise
 
@@ -307,6 +316,7 @@ Environment variables:
 | `PUBLIC_HOST` | *(unset)* | Bare public hostname, added to the DNS-rebinding allowlist. Set automatically by `launch.py`; unset means local-only. |
 | `ENABLE_OCR` | `1` | Set to `0` to skip image OCR entirely. |
 | `OCR_PER_CALL` | `40` | Maximum images OCR'd per tool call. Images beyond this degrade silently to `[图片]`. |
+| `OCR_MAX_AGE_DAYS` | `7` | Skip OCR for images older than this, without spending budget on them. `0` disables the check. |
 
 Read by `launch.py` only:
 
