@@ -78,6 +78,8 @@ WATCH_GROUPS: set[int] = {
 MAX_COUNT = 300          # 单次最多拉多少条原始消息
 MAX_PAGES = 8            # 向前翻页的最大轮数，防止 NapCat 一直回同一批时死循环
 MAX_MSG_CHARS = 400      # 单条消息截断长度
+MAX_CHAIN_CHARS = 2000   # 接龙链最终版的截断长度，比普通消息宽（它替掉了一整串冗余副本）
+MIN_CHAIN_CHARS = 60     # 前缀短于此不算接龙，避免「好」→「好的」被误判成链
 MIN_MSG_CHARS = 2        # 短于此的正文直接丢
 
 # 图片 OCR：走 NapCat 的 ocr_image（腾讯自家中文 OCR，免费、无本地依赖）
@@ -417,8 +419,24 @@ def render_segments(segments: Any, ocr_budget: list[int] | None = None) -> tuple
     # 只压缩行内空白，保留 OCR 还原出来的换行（表格的行结构靠它）
     text = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in joined.split("\n")).strip()
 
-    limit = MAX_MSG_CHARS + OCR_MAX_CHARS if "[图片内容↓" in text else MAX_MSG_CHARS
-    return redact(text[:limit]), mentioned
+    # 这里不截断。折叠要拿完整正文比对，截断推迟到 format_transcript。
+    # 以前是先截后比，只在 400 字之后才不同的消息（接龙正是如此）会被判成「相同内容」折成一条。
+    # 顺带修掉一个副作用：以前截断可能把手机号腰斩，剩下的半截匹配不上正则，redact 就漏了。
+    return redact(text), mentioned
+
+
+def truncate_text(text: str, chain: bool = False) -> str:
+    """按内容类型截断，供输出层调用。"""
+    if chain:
+        limit = MAX_CHAIN_CHARS
+    elif "[图片内容↓" in text:
+        limit = MAX_MSG_CHARS + OCR_MAX_CHARS
+    else:
+        limit = MAX_MSG_CHARS
+    if len(text) <= limit:
+        return text
+    # 明确标出来：以前是静默截断，模型会把半截的接龙名单当成完整名单。
+    return text[:limit] + "…[已截断]"
 
 
 def fetch_history(group_id: int, count: int, cutoff_ts: float = 0) -> list[dict]:
@@ -507,10 +525,23 @@ def clean_history(raw_messages: list[dict]) -> tuple[list[dict], int]:
         # repeat 记的是"消息条数"，repeat_senders 记的是"去重后的其他发言人"，
         # 两者含义不同，别拿 repeat - 1 当人数用：一个人连刷 5 条时那样会写成
         # "另有 4 人发送相同内容"，等于凭空造出四个人，比不折叠还糟。
-        if cleaned and cleaned[-1]["text"] == text:
-            prev = cleaned[-1]
+        # 接龙是「累积型」消息：每条都是上一条再加一个名字。整串发给模型九成是冗余，
+        # 而唯一有价值的恰恰是最后那条完整版——所以链上只留最后一条，不是第一条。
+        # 判据是严格前缀扩展；实测某群 29 条接龙，链内 16/16 和 11/11 全部命中。
+        prev = cleaned[-1] if cleaned else None
+        is_chain = (
+            prev is not None
+            and len(prev["text"]) >= MIN_CHAIN_CHARS
+            and len(text) > len(prev["text"])
+            and text.startswith(prev["text"])
+        )
+        if prev is not None and (prev["text"] == text or is_chain):
             prev["repeat"] += 1
             prev["last_ts"] = msg.get("time", 0)   # 折叠段的结束时间，用来显示跨度
+            if is_chain:
+                prev["text"] = text                # 换成更完整的那一版
+                prev["chain"] = True
+                prev["chain_last_sender"] = name   # 正文是这个人发的，别记到行首那位头上
             # 原发言人已经显示在行首，不能再算成"另一个人"
             if name != prev["sender"] and name not in prev["repeat_senders"]:
                 prev["repeat_senders"].append(name)
@@ -527,6 +558,8 @@ def clean_history(raw_messages: list[dict]) -> tuple[list[dict], int]:
                 "mentions_me": self_id() in mentioned,
                 "repeat": 1,
                 "repeat_senders": [],
+                "chain": False,
+                "chain_last_sender": "",
             }
         )
 
@@ -565,21 +598,32 @@ def format_transcript(group_name: str, messages: list[dict], raw_count: int) -> 
     ]
     for m in messages:
         flag = " «@我»" if m["mentions_me"] else ""
-        line = f"[{m['time']}] {m['sender']}{flag}: {m['text']}"
+        body = truncate_text(m["text"], chain=m.get("chain", False))
+        line = f"[{m['time']}] {m['sender']}{flag}: {body}"
         repeat = m.get("repeat", 1)
         if repeat > 1:
+            # 人数只能按 others 算。名字最多列 5 个，列不下才加"等"。
             others = m.get("repeat_senders") or []
-            if others:
-                # 人数只能按 others 算。名字最多列 5 个，列不下才加"等"。
-                shown = "、".join(others[:5])
-                last = m.get("last_ts")
-                span = ""
-                if last and last != m["ts"]:
-                    span = "，最后一条 " + datetime.fromtimestamp(last, DISPLAY_TZ).strftime("%H:%M")
-                line += (
-                    f"（另有 {len(others)} 人发送相同内容："
-                    f"{shown}{' 等' if len(others) > 5 else ''}{span}）"
-                )
+            shown = "、".join(others[:5]) + (" 等" if len(others) > 5 else "")
+            last = m.get("last_ts")
+            when = ""
+            if last and last != m["ts"]:
+                when = datetime.fromtimestamp(last, DISPLAY_TZ).strftime("%H:%M")
+            if m.get("chain"):
+                # 接龙不是复读：这几条内容各不相同，只是后一条包含前一条。
+                # 说成"发送相同内容"是错的，而且正文已经换成最完整的那版，得说清是谁发的。
+                who = m.get("chain_last_sender") or ""
+                src = f"，正文为 {who}{' 于 ' + when if when else ''} 发出的最终版" if who else ""
+                if others:
+                    line += (
+                        f"（接龙链：共 {len(others)} 人依次追加{src}；参与者：{shown}）"
+                    )
+                else:
+                    # 没有其他发言人 = 同一个人反复续写自己那条
+                    line += f"（同一人续写 {repeat} 次，正文为最终版）"
+            elif others:
+                span = f"，最后一条 {when}" if when else ""
+                line += f"（另有 {len(others)} 人发送相同内容：{shown}{span}）"
             else:
                 # 没有其他发言人 = 同一个人在连续刷屏
                 line += f"（同一人连发 {repeat} 次）"
@@ -779,7 +823,11 @@ def get_my_mentions(hours: int = 24, count: int = 200) -> str:
             window = msgs[max(0, i - 1) : i + 2]
             blocks.append(
                 f"— 群 {gid} —\n"
-                + "\n".join(f"[{w['time']}] {w['sender']}: {w['text']}" for w in window)
+                + "\n".join(
+                    f"[{w['time']}] {w['sender']}: "
+                    f"{truncate_text(w['text'], chain=w.get('chain', False))}"
+                    for w in window
+                )
             )
 
     if not blocks:

@@ -300,6 +300,8 @@ Tunables at the top of `qq_digest_mcp.py`:
 | --- | --- | --- |
 | `MAX_COUNT` | `300` | Hard cap on raw messages fetched per call. |
 | `MAX_MSG_CHARS` | `400` | Per-message truncation length. |
+| `MAX_CHAIN_CHARS` | `2000` | Truncation length for the surviving message of a 接龙 chain. Wider, because that one message replaced the whole redundant run. |
+| `MIN_CHAIN_CHARS` | `60` | A prefix shorter than this is not treated as a chain, so "ok" → "ok then" is not mistaken for one. |
 | `MIN_MSG_CHARS` | `2` | Messages shorter than this are dropped. |
 | `OCR_MAX_CHARS` | `600` | Per-image OCR truncation length. |
 | `OCR_ROW_TOLERANCE` | `12` | Y-coordinate delta below which OCR boxes count as the same row. |
@@ -309,7 +311,8 @@ Tunables at the top of `qq_digest_mcp.py`:
 Raw OneBot message segments go through several passes before the model sees them:
 
 - **Noise removal.** Pure emoji, punctuation, and filler ("哈", "6", "awsl") are dropped, as are messages shorter than `MIN_MSG_CHARS`.
-- **De-duplication.** Consecutive identical messages (复读) collapse to one.
+- **De-duplication.** Consecutive identical messages (复读) collapse to one. Comparison uses the **untruncated** body — folding on truncated text used to merge messages that differed only past `MAX_MSG_CHARS`.
+- **Chain collapse (接龙).** A 接龙 is cumulative: each message is the previous one plus one more name. When a message is a strict prefix-extension of the one before it, the run collapses to its **last** member — the only complete copy — and the annotation says `接龙链` rather than "sent the same content", crediting the final text to whoever actually posted it. Measured on a real group: 29 messages, 41 names, previously rendered as entries 1–18 with a false repeat count.
 - **Image OCR.** Group notices, timetables and exam schedules are usually screenshots, so images are run through NapCat's `ocr_image` (Tencent's own Chinese OCR — free, no local dependency). Results are **reassembled into rows** by Y-coordinate and sorted by X, so tables survive as tables instead of collapsing into one line. Results are cached by `file_unique`, and OCR failures are swallowed rather than failing the digest.
 - **Card unwrapping.** Group announcements (`com.tencent.mannounce`) carry their body as base64; it gets decoded rather than fed to the model as gibberish. Other shares degrade to `[分享:title]`.
 - **Redaction.** Phone numbers are masked, ID card numbers are removed, and `密码：xxx` / `token: xxx`-style plaintext credentials are stripped before anything leaves the server.
