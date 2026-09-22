@@ -81,6 +81,7 @@ MAX_MSG_CHARS = 400      # 单条消息截断长度
 MAX_CHAIN_CHARS = 2000   # 接龙链最终版的截断长度，比普通消息宽（它替掉了一整串冗余副本）
 MIN_CHAIN_CHARS = 60     # 前缀短于此不算接龙，避免「好」→「好的」被误判成链
 MIN_MSG_CHARS = 2        # 短于此的正文直接丢
+REPLY_QUOTE_CHARS = 60   # 引文只留能认出原消息的开头，不喧宾夺主
 
 # 图片 OCR：走 NapCat 的 ocr_image（腾讯自家中文 OCR，免费、无本地依赖）
 ENABLE_OCR = os.environ.get("ENABLE_OCR", "1") == "1"
@@ -395,8 +396,41 @@ def render_card(raw: str) -> str:
     return f"[分享:{m.group(1)}]" if m else "[卡片]"
 
 
+_reply_cache: dict[str, str] = {}   # message_id -> 引文，一条热门通知底下挂十几条回复也只查一次
+
+
+def resolve_reply(msg_id: str) -> str:
+    """reply 段只带一个 message_id，原文得拿它去 get_msg 点查。失败返回空串。
+
+    不能靠「把历史窗口开大」顺带捞到：QQ 允许引用任意久远的消息，实测同一个群里
+    就有间隔 8.2 天的引用，任何「最近 N 条 / N 小时」的窗口都不保证覆盖。
+    """
+    if not msg_id:
+        return ""
+    if msg_id in _reply_cache:
+        return _reply_cache[msg_id]
+
+    quote = ""
+    try:
+        orig = napcat("get_msg", message_id=int(msg_id)) or {}
+        # 引文里不再解引用（回复的回复会成链），也不花 OCR 预算（给一份已耗尽的）
+        text, _ = render_segments(orig.get("message"), [0], resolve_replies=False)
+        flat = " ".join(text.split())
+        if flat:
+            quote = flat[:REPLY_QUOTE_CHARS] + ("…" if len(flat) > REPLY_QUOTE_CHARS else "")
+    except Exception:
+        # 原消息可能已撤回或过期，get_msg 会返回非 0，属于正常情况，降级成裸 [回复]
+        quote = ""
+
+    _reply_cache[msg_id] = quote
+    return quote
+
+
 def render_segments(
-    segments: Any, ocr_budget: list[int] | None = None, msg_ts: float = 0
+    segments: Any,
+    ocr_budget: list[int] | None = None,
+    msg_ts: float = 0,
+    resolve_replies: bool = True,
 ) -> tuple[str, list[int]]:
     """把 OneBot array 格式的消息段压成一行纯文本，同时返回被 @ 的 QQ 号。"""
     ocr_budget = ocr_budget if ocr_budget is not None else [0]
@@ -422,7 +456,8 @@ def render_segments(
                 if str(qq).isdigit():
                     mentioned.append(int(qq))
         elif stype == "reply":
-            parts.append("[回复]")
+            quote = resolve_reply(str(data.get("id", ""))) if resolve_replies else ""
+            parts.append(f"[回复“{quote}”]" if quote else "[回复]")
         elif stype == "image":
             # 群里的通知、课表、考试安排大多是图片，靠 OCR 才能进简报
             recognized = ocr_image(data, ocr_budget, msg_ts)
@@ -431,7 +466,8 @@ def render_segments(
             else:
                 parts.append(f"[图片{':' + data['summary'] if data.get('summary') else ''}]")
         elif stype == "file":
-            parts.append(f"[文件:{data.get('name', '')}]")
+            # 实测 data 的键是 file/file_id/file_size/url，没有 name；两个都兼容
+            parts.append(f"[文件:{data.get('file') or data.get('name') or ''}]")
         elif stype == "record":
             parts.append("[语音]")
         elif stype == "video":
